@@ -1,0 +1,24 @@
+# Environment
+.env
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Outputs
+outputs/
+*.wav
+*.mp3
+*.mp4
+*.m4a
+meetily_src/
+# Models cache (auto-downloaded)
+models/
+~/.cache/huggingface/
+
+# Editor
+.vscode/
+.idea/
+*.DS_Store
+Thumbs.db
