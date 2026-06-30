@@ -25,6 +25,10 @@ import sounddevice as sd
 import soundfile as sf
 import gradio as gr
 
+from fastapi import FastAPI, Request, Form, Query
+import uvicorn
+import subprocess
+
 from src.audio.devices import device_names, device_by_label, find_loopback_device
 from src.audio.recorder import AudioRecorder
 from src.config import IS_MAC, IS_WIN, LIVE_CHUNK_DURATION_S, SAMPLE_RATE
@@ -44,6 +48,52 @@ _live_transcriber = None
 _live_thread: Optional[threading.Thread] = None
 _last_poll_time: float = 0.0
 _live_lock = threading.Lock()
+
+# ── Global browser live session state ─────────────────────────────────────────
+_browser_audio_chunks = []
+_browser_live_transcriber = None
+_browser_live_lock = threading.Lock()
+_browser_live_title = "live_meeting"
+_browser_live_out_dir = None
+
+# ── FastAPI Application & Endpoints ───────────────────────────────────────────
+fastapi_app = FastAPI()
+
+@fastapi_app.post("/api/live/start")
+async def api_live_start(title: str = Form("live_meeting"), force_language: str = Form(None)):
+    global _browser_live_transcriber, _browser_audio_chunks, _browser_live_title
+    with _browser_live_lock:
+        if _browser_live_transcriber and _browser_live_transcriber.is_running:
+            return {"status": "error", "message": "Phiên live đang chạy!"}
+        
+        from src.live_transcribe import LiveTranscriber
+        _browser_live_title = title or "live_meeting"
+        lang = force_language if force_language and force_language != "Auto" else None
+        _browser_live_transcriber = LiveTranscriber(
+            title=_browser_live_title,
+            force_language=lang
+        )
+        _browser_live_transcriber.start()
+        _browser_audio_chunks = []
+        logger.info("API: Live browser session started - Title: %s, Lang: %s", _browser_live_title, lang)
+    return {"status": "success"}
+
+@fastapi_app.post("/api/live/chunk")
+async def api_live_chunk(request: Request, offset_s: float = Query(...)):
+    global _browser_live_transcriber, _browser_audio_chunks
+    body = await request.body()
+    if len(body) == 0:
+        return {"status": "success", "message": "Empty chunk"}
+    
+    # Bytes to float32 numpy array
+    audio_np = np.frombuffer(body, dtype=np.float32)
+    
+    with _browser_live_lock:
+        if _browser_live_transcriber and _browser_live_transcriber.is_running:
+            _browser_audio_chunks.append(audio_np.copy())
+            _browser_live_transcriber.process_chunk(audio_np, offset_s)
+    return {"status": "success"}
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -347,9 +397,54 @@ def stop_live():
     return status, html_transcript, transcript_file, gr.update(visible=bool(wav_path), value=wav_path)
 
 
+def stop_browser_live_python():
+    global _browser_live_transcriber, _browser_audio_chunks
+    with _browser_live_lock:
+        if _browser_live_transcriber is None:
+            return "⚠️ Không có phiên live nào đang chạy.", "", None, gr.update(visible=False)
+            
+        out_dir = _browser_live_transcriber.stop()
+        
+        # Save recording
+        wav_path = None
+        if _browser_audio_chunks and out_dir:
+            try:
+                full_audio = np.concatenate(_browser_audio_chunks)
+                wav_file = out_dir / "recording.wav"
+                sf.write(str(wav_file), full_audio, SAMPLE_RATE)
+                if wav_file.exists():
+                    wav_path = str(wav_file)
+                logger.info("Saved browser recording to %s", wav_file)
+            except Exception as e:
+                logger.error("Failed to save browser recording: %s", e)
+                
+        # Read final updates
+        updates_list = list(_browser_live_transcriber.session.updates)
+        duration = _browser_live_transcriber.session.get_duration_s()
+        langs = _browser_live_transcriber.session.get_languages()
+        n_updates = len(updates_list)
+        
+        _browser_live_transcriber = None
+        _browser_audio_chunks = []
+        
+    dm, ds = divmod(int(duration), 60)
+    status = (
+        f"✅ Phiên live kết thúc! "
+        f"Thời lượng: **{dm:02d}:{ds:02d}** | "
+        f"Ngôn ngữ: **{', '.join(sorted(langs)) if langs else 'N/A'}** | "
+        f"Cập nhật: **{n_updates}** | "
+        f"Lưu tại: `{out_dir}`"
+    )
+
+    transcript_file = str(out_dir / "transcript_live.txt") if out_dir else None
+    html_transcript = _render_interactive_transcript(updates_list, "browser_live_playback_audio")
+    
+    return status, html_transcript, transcript_file, gr.update(visible=bool(wav_path), value=wav_path)
+
+
 def poll_live_transcript():
     """Poll current live transcript for UI updates."""
-    global _last_poll_time
+    global _last_poll_time, _live_transcriber, _browser_live_transcriber
     _last_poll_time = time.time()
 
     if _live_transcriber and _live_transcriber.is_running:
@@ -363,6 +458,18 @@ def poll_live_transcript():
             f"Ngôn ngữ: {', '.join(sorted(langs)) if langs else '…'}"
         )
         html = _render_interactive_transcript(_live_transcriber.session.updates, "live_playback_audio")
+        return status, html
+    elif _browser_live_transcriber and _browser_live_transcriber.is_running:
+        elapsed = _browser_live_transcriber.session.get_duration_s()
+        langs = _browser_live_transcriber.session.get_languages()
+        n = len(_browser_live_transcriber.session.updates)
+        em, es = divmod(int(elapsed), 60)
+        status = (
+            f"🔴 **LIVE (Trình duyệt)** — {em:02d}:{es:02d} | "
+            f"{n} đoạn | "
+            f"Ngôn ngữ: {', '.join(sorted(langs)) if langs else '…'}"
+        )
+        html = _render_interactive_transcript(_browser_live_transcriber.session.updates, "browser_live_playback_audio")
         return status, html
     return gr.update(), gr.update()
 
@@ -836,6 +943,337 @@ Chọn **mic** (giọng bạn) và/hoặc **loopback** (âm thanh hệ thống t
                 outputs=[live_timer],
             )
 
+        with gr.Tab("🌐 Live từ Trình duyệt"):
+            gr.Markdown(
+                """
+### 🌐 Live từ Trình duyệt (Không cần VB-CABLE)
+
+Ghi âm và bóc băng trực tiếp thông qua micro và âm thanh của trình duyệt mà không cần cài đặt bất kỳ phần mềm loopback nào!
+- **Để bóc băng cuộc họp online (Google Meet, Zoom web...):** Chọn nguồn **Cả hai (Mic + Loa)** hoặc **Chỉ Loa (Hệ thống)**. Khi trình duyệt hiện hộp thoại chia sẻ màn hình, hãy chọn tab/màn hình cuộc họp và tích chọn **"Chia sẻ âm thanh hệ thống/tab"** (Share tab audio).
+- **Để bóc băng phòng họp trực tiếp:** Chọn nguồn **Chỉ Microphone**.
+"""
+            )
+
+            browser_js_code = """
+            <script>
+            // Biến toàn cục kiểm soát ghi âm ở trình duyệt
+            window.browserAudioActive = false;
+            window.browserAudioCtx = null;
+            window.browserAudioProcessor = null;
+            window.browserAudioStreams = [];
+            window.browserAudioOffset = 0;
+
+            async function startBrowserAudioCapture(title, lang) {
+                if (window.browserAudioActive) return;
+                
+                try {
+                    // Lọc nguồn âm thanh từ radio buttons của Gradio
+                    const sourceChoice = document.querySelector("#browser_audio_source input:checked")?.value || "🔊 Cả hai (Mic + Loa)";
+                    console.log("Selected source:", sourceChoice);
+                    
+                    let micStream = null;
+                    let systemStream = null;
+                    
+                    if (sourceChoice.includes("Mic") || sourceChoice.includes("Cả hai")) {
+                        micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                    }
+                    
+                    if (sourceChoice.includes("Loa") || sourceChoice.includes("Cả hai")) {
+                        systemStream = await navigator.mediaDevices.getDisplayMedia({
+                            video: { width: 1, height: 1 },
+                            audio: true
+                        });
+                    }
+                    
+                    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+                    const audioCtx = new AudioContextClass({ sampleRate: 16000 });
+                    window.browserAudioCtx = audioCtx;
+                    
+                    const processor = audioCtx.createScriptProcessor(4096, 1, 1);
+                    window.browserAudioProcessor = processor;
+                    
+                    let merger = null;
+                    let micSource = null;
+                    let systemSource = null;
+                    
+                    if (micStream && systemStream) {
+                        merger = audioCtx.createChannelMerger(2);
+                        micSource = audioCtx.createMediaStreamSource(micStream);
+                        systemSource = audioCtx.createMediaStreamSource(systemStream);
+                        micSource.connect(merger, 0, 0);
+                        systemSource.connect(merger, 0, 1);
+                        
+                        // Mix down to mono
+                        const mixNode = audioCtx.createGain();
+                        merger.connect(mixNode);
+                        mixNode.connect(processor);
+                    } else if (micStream) {
+                        micSource = audioCtx.createMediaStreamSource(micStream);
+                        micSource.connect(processor);
+                    } else if (systemStream) {
+                        systemSource = audioCtx.createMediaStreamSource(systemStream);
+                        systemSource.connect(processor);
+                    } else {
+                        alert("Vui lòng chọn ít nhất 1 nguồn âm thanh!");
+                        return;
+                    }
+                    
+                    processor.connect(audioCtx.destination);
+                    
+                    window.browserAudioStreams = [micStream, systemStream].filter(s => s !== null);
+                    window.browserAudioActive = true;
+                    window.browserAudioOffset = 0;
+                    
+                    let buffer = [];
+                    const chunkSamples = 5 * 16000; // 5s chunk
+                    
+                    processor.onaudioprocess = (e) => {
+                        if (!window.browserAudioActive) return;
+                        const channelData = e.inputBuffer.getChannelData(0);
+                        buffer.push(...channelData);
+                        
+                        if (buffer.length >= chunkSamples) {
+                            const chunk = buffer.slice(0, chunkSamples);
+                            buffer = buffer.slice(chunkSamples);
+                            
+                            const currentOffset = window.browserAudioOffset;
+                            window.browserAudioOffset += 5;
+                            
+                            sendAudioChunk(chunk, currentOffset);
+                        }
+                    };
+                    
+                    // Gọi API start của FastAPI backend
+                    const formData = new FormData();
+                    formData.append("title", title || "live_meeting");
+                    formData.append("force_language", lang || "Auto");
+                    
+                    fetch("/api/live/start", {
+                        method: "POST",
+                        body: formData
+                    }).then(res => res.json())
+                      .then(data => console.log("Session started on server:", data))
+                      .catch(err => console.error("Error starting server session:", err));
+
+                    console.log("Browser capture started successfully.");
+                } catch (err) {
+                    console.error("Error starting browser capture:", err);
+                    alert("Lỗi khởi tạo thu âm trình duyệt: " + err.message);
+                    window.browserAudioActive = false;
+                }
+            }
+
+            function sendAudioChunk(samples, offset) {
+                const float32Array = new Float32Array(samples);
+                const buffer = float32Array.buffer;
+                
+                fetch(`/api/live/chunk?offset_s=${offset}`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/octet-stream'
+                    },
+                    body: buffer
+                }).then(res => res.json())
+                  .then(data => console.log(`Sent chunk at ${offset}s`, data))
+                  .catch(err => console.error("Error sending chunk:", err));
+            }
+
+            function stopBrowserAudioCapture() {
+                window.browserAudioActive = false;
+                
+                if (window.browserAudioProcessor) {
+                    window.browserAudioProcessor.disconnect();
+                    window.browserAudioProcessor = null;
+                }
+                
+                if (window.browserAudioCtx) {
+                    window.browserAudioCtx.close();
+                    window.browserAudioCtx = null;
+                }
+                
+                if (window.browserAudioStreams) {
+                    window.browserAudioStreams.forEach(stream => {
+                        stream.getTracks().forEach(track => track.stop());
+                    });
+                    window.browserAudioStreams = [];
+                }
+                console.log("Browser capture stopped.");
+            }
+            </script>
+            """
+            gr.HTML(browser_js_code)
+
+            with gr.Row():
+                browser_audio_src = gr.Radio(
+                    choices=["🎤 Chỉ Microphone", "🔊 Chỉ Loa (Hệ thống)", "🔊 Cả hai (Mic + Loa)"],
+                    value="🔊 Cả hai (Mic + Loa)",
+                    label="🎙️ Chọn nguồn âm thanh thu từ trình duyệt",
+                    elem_id="browser_audio_source"
+                )
+
+            with gr.Row():
+                browser_title = gr.Textbox(
+                    label="Tên cuộc họp",
+                    placeholder="Cuộc họp qua Browser",
+                    value="",
+                    scale=2,
+                )
+                browser_language = gr.Radio(
+                    choices=["Auto", "vi", "en", "ja"],
+                    value="Auto",
+                    label="🌐 Ngôn ngữ (chọn nhanh)",
+                    scale=1,
+                )
+
+            browser_auto_process_chk = gr.Checkbox(
+                label="☑️ Tự động Xử lý chuyên sâu (Phân biệt người nói & Tóm tắt) sau khi kết thúc Live",
+                value=True,
+            )
+
+            with gr.Row():
+                btn_browser_start = gr.Button(
+                    "🔴 Khởi động & Ghi âm",
+                    variant="primary",
+                    size="lg",
+                )
+                btn_browser_stop = gr.Button(
+                    "⏹️ Dừng & Lưu",
+                    variant="stop",
+                    size="lg",
+                )
+
+            browser_status = gr.Markdown("*Chưa bắt đầu*")
+
+            browser_playback = gr.Audio(
+                label="🔈 Phát lại Audio gốc (có thể click vào transcript bên dưới để nghe)",
+                type="filepath",
+                visible=False,
+                elem_id="browser_live_playback_audio"
+            )
+
+            browser_transcript = gr.HTML(
+                label="Transcript trực tiếp",
+                value="<div style='padding: 10px; color: #666;'>Chưa có dữ liệu...</div>"
+            )
+
+            dl_browser_live = gr.File(label="⬇️ Tải transcript live (.txt)", visible=False)
+
+            # ── Post-processing UI (Hidden initially) ──
+            with gr.Group(visible=False) as browser_post_group:
+                gr.Markdown("---")
+                gr.Markdown("### ⚙️ Kết quả Xử lý Chuyên sâu")
+                browser_post_status = gr.Markdown("⏳ Đang đợi xử lý...")
+                with gr.Row():
+                    browser_post_vi = gr.Textbox(label="Bản dịch tinh chỉnh (Đã phân biệt người nói)", lines=15, interactive=False)
+                    browser_post_sum = gr.Markdown("*(Đang tóm tắt...)*")
+
+            # ── Browser live button wiring ────────────────────────────────────
+            def _start_browser_live_wrapper(title, lang_choice):
+                lang = _resolve_lang(lang_choice)
+                global _browser_live_transcriber, _browser_audio_chunks, _browser_live_title
+                with _browser_live_lock:
+                    if _browser_live_transcriber and _browser_live_transcriber.is_running:
+                        return "⚠️ Phiên live đang chạy!", ""
+                    
+                    from src.live_transcribe import LiveTranscriber
+                    _browser_live_title = title or "live_meeting"
+                    _browser_live_transcriber = LiveTranscriber(
+                        title=_browser_live_title,
+                        force_language=lang
+                    )
+                    _browser_live_transcriber.start()
+                    _browser_audio_chunks = []
+                return "🔴 **LIVE (Trình duyệt)** — Đang ghi và nhận dạng từ trình duyệt …", ""
+
+            def _update_browser_live_lang(lang_choice):
+                global _browser_live_transcriber
+                if _browser_live_transcriber:
+                    _browser_live_transcriber.force_language = _resolve_lang(lang_choice)
+
+            browser_language.change(fn=_update_browser_live_lang, inputs=[browser_language])
+
+            # Trigger JS start capturing on browser
+            btn_browser_start.click(
+                fn=_start_browser_live_wrapper,
+                inputs=[browser_title, browser_language],
+                outputs=[browser_status, browser_transcript],
+                js="async (title, lang) => { await startBrowserAudioCapture(title, lang); }"
+            )
+
+            # Auto-refresh live transcript with Timer
+            browser_timer = gr.Timer(value=3, active=False)
+
+            def _poll_browser():
+                return poll_live_transcript()
+
+            browser_timer.tick(fn=_poll_browser, outputs=[browser_status, browser_transcript])
+
+            # Activate timer
+            btn_browser_start.click(
+                fn=lambda: gr.Timer(active=True),
+                outputs=[browser_timer],
+            )
+
+            # Stop browser live and show results
+            def _stop_browser_live_wrapper():
+                status, html, fpath, audio_upd = stop_browser_live_python()
+                wav_path = None
+                if fpath:
+                    import os
+                    dir_path = os.path.dirname(fpath)
+                    wav_file = os.path.join(dir_path, "recording.wav")
+                    if os.path.exists(wav_file):
+                        wav_path = wav_file
+                return (
+                    status,
+                    html,
+                    gr.update(visible=bool(fpath), value=fpath),
+                    audio_upd,
+                    wav_path
+                )
+
+            # Hidden textbox to store wav path from stop
+            browser_wav_path_hidden = gr.Textbox(visible=False)
+
+            btn_browser_stop.click(
+                fn=_stop_browser_live_wrapper,
+                outputs=[browser_status, browser_transcript, dl_browser_live, browser_playback, browser_wav_path_hidden],
+                js="() => { stopBrowserAudioCapture(); }"
+            )
+            
+            btn_browser_stop.click(
+                fn=lambda: gr.Timer(active=False),
+                outputs=[browser_timer],
+            )
+
+            # Chain the post-process
+            browser_wav_path_hidden.change(
+                fn=check_auto_process,
+                inputs=[browser_wav_path_hidden, browser_auto_process_chk],
+                outputs=[browser_post_group, browser_post_status]
+            )
+
+            def _browser_run_process(wav, do_auto, title, progress=gr.Progress(track_tqdm=False)):
+                if not wav or not do_auto:
+                    return "Bỏ qua.", "", ""
+                status, orig, vi, summ, dl_orig, dl_vi, dl_sum = process(
+                    "📁 Tải file lên",
+                    wav,
+                    None,
+                    title,
+                    "",
+                    False,
+                    progress
+                )
+                return status, vi, summ
+
+            browser_wav_path_hidden.change(
+                fn=_browser_run_process,
+                inputs=[browser_wav_path_hidden, browser_auto_process_chk, browser_title],
+                outputs=[browser_post_status, browser_post_vi, browser_post_sum],
+                trigger_mode="once"
+            )
+
         # ── Wire up batch process button ──────────────────────────────────────
         def _process_wrapper(mode, f, dev, title, ns, skip, progress=gr.Progress()):
             audio = f
@@ -951,10 +1389,17 @@ Chọn **mic** (giọng bạn) và/hoặc **loopback** (âm thanh hệ thống t
 
 if __name__ == "__main__":
     demo = build_ui()
-    demo.launch(
-        server_name="0.0.0.0",
-        server_port=7860,
-        share=False,
-        inbrowser=True,
-        theme=gr.themes.Soft(),
-    )
+    # Bọc Gradio app bằng FastAPI app
+    app = gr.mount_gradio_app(fastapi_app, demo, path="/")
+    
+    # Tự động mở trình duyệt
+    import webbrowser
+    def open_browser():
+        time.sleep(1.5)
+        webbrowser.open("http://localhost:7860")
+        
+    threading.Thread(target=open_browser, daemon=True).start()
+    
+    # Khởi chạy uvicorn
+    logger.info("Starting uvicorn server on http://localhost:7860")
+    uvicorn.run(app, host="0.0.0.0", port=7860)
