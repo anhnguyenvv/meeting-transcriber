@@ -6,18 +6,21 @@ An enterprise-grade, fully **offline and local** meeting transcription, speaker 
 
 ## 🏗️ System Architecture & Data Flow
 
-The diagram below shows the end-to-end data flow, illustrating how raw audio is captured, processed, and aligned using local models, alongside the MLOps evaluation and monitoring loops.
+The diagram below shows the end-to-end data flow, illustrating how raw audio is captured (either via local devices or streamingly from the browser), processed, and aligned using local models, alongside the MLOps evaluation and monitoring loops.
 
 ```mermaid
 flowchart TD
     subgraph Input_Layer [Input Layer]
-        A1[Live Audio Input: Mic + Loopback]
+        A1[Live Audio Input: Mic + Loopback VB-Cable]
         A2[Uploaded Audio File]
         A3[Evaluation Samples & Ground Truth]
+        A4[Browser Web Audio API: Mic + Tab Audio]
     end
 
     subgraph Audio_Processing [Audio Processing & Mixing]
         B1[Smart Ducking & Mixer] --> B2[FFmpeg Resampler: 16kHz Mono]
+        A4 --> |HTTP POST chunks| B3[FastAPI Endpoints]
+        B3 --> |Accumulate float32| B2
     end
 
     subgraph Core_AI_Pipeline [Core AI Pipeline]
@@ -67,7 +70,7 @@ Here we evaluate the core technologies integrated into this project against indu
 | **Speaker Diarization** | **Pyannote.audio** | Silero VAD, NVIDIA NeMo | - **Silero VAD**: Only detects active voice regions, cannot identify *who* spoke.<br>- **NVIDIA NeMo**: Extremely heavy and complex to set up locally on diverse user machines.<br>- **Pyannote.audio**: State-of-the-art open-source diarization model with high accuracy and active community support. |
 | **Local LLM Engine** | **Ollama** | Llama.cpp raw, vLLM, LM Studio | - **Llama.cpp raw**: Hard to manage models, templates, and server settings manually.<br>- **vLLM**: Server-grade; lacks native support for local Windows/macOS client deployments.<br>- **Ollama**: Provides a standardized OpenAI-compatible HTTP API, handles model loading/unloading, and auto-optimizes for CPU/GPU/Apple Silicon out of the box. |
 | **LLM Model** | **Qwen2.5 (3B/7B)** | LLaMA 3 (8B), Gemma 2 (9B) | - **LLaMA 3**: Poor native Vietnamese/Japanese localization; prone to code-switching issues.<br>- **Gemma 2**: High hardware requirement; slower inference speed.<br>- **Qwen2.5**: Optimized for multilingual context (Vietnamese, English, Japanese) with excellent summarization capabilities in a compact footprint. |
-| **User Interface** | **Gradio** | Streamlit, React + FastAPI | - **React + FastAPI**: Overkill for a local desktop tool; slows down iteration.<br>- **Streamlit**: Lacks flexible events for streaming audio recording callbacks.<br>- **Gradio**: Native Python UI with built-in audio players, timers, and streaming controls. |
+| **User Interface / Backend** | **Gradio wrapped in FastAPI (Uvicorn)** | Streamlit, React + FastAPI | - **React + FastAPI**: Tốn thời gian tách biệt frontend/backend; không cần thiết cho desktop tool.<br>- **Streamlit**: Không hỗ trợ tùy biến các callback JavaScript client-side thu âm thời gian thực.<br>- **Gradio + FastAPI**: Cho phép sử dụng giao diện Gradio nhanh chóng trong khi mở rộng các endpoint API của FastAPI để nhận stream audio trực tiếp từ trình duyệt của người dùng mà không cần phần mềm loopback. |
 
 ---
 
@@ -115,6 +118,27 @@ def _best_speaker(seg_start: float, seg_end: float, turns: List[SpeakerTurn]) ->
     best_turn = min(turns, key=lambda t: abs((t.start + t.end) / 2 - seg_mid))
     return best_turn.speaker
 ```
+
+### 3. Zero-Driver System Audio Capture via Web Audio API
+**Challenge:** In standard local setups, capturing system loopback (other meeting participants) requires installing complex third-party kernel loopback drivers (like VB-CABLE on Windows or BlackHole on macOS).
+**Solution:** We built a native web-based capture pipeline using **Web Audio API** and **FastAPI**. The browser prompts the user to share their screen/tab with system audio (`getDisplayMedia({audio: true})`) and captures the microphone (`getUserMedia({audio: true})`). It merges these two sources on the client side using a `ChannelMergerNode`, downsamples the audio to 16kHz mono, and transmits binary 5-second `Float32Array` chunks over HTTP POST to the FastAPI backend:
+
+```javascript
+// Merge mic and system loopback streams on client-side
+merger = audioCtx.createChannelMerger(2);
+micSource = audioCtx.createMediaStreamSource(micStream);
+systemSource = audioCtx.createMediaStreamSource(systemStream);
+micSource.connect(merger, 0, 0);
+systemSource.connect(merger, 0, 1);
+
+// Downsample and mix to mono
+const mixNode = audioCtx.createGain();
+merger.connect(mixNode);
+mixNode.connect(processor);
+```
+
+On the backend, FastAPI endpoints (`/api/live/chunk`) receive the binary data, decode it directly into NumPy float32 arrays, and stream them into the `LiveTranscriber` pipeline.
+
 
 ---
 
