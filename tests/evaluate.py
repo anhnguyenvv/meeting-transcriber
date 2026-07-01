@@ -169,8 +169,8 @@ def main():
     print(f"- Total Processing Time:  {total_processing_time:.2f}s")
     print(f"- Average Real-Time Factor (RTF): {overall_rtf:.2f}")
     
-    # Save report
-    report_path = Path(__file__).parent / "evaluation_report.json"
+    # Save report JSON
+    report_json_path = Path(__file__).parent / "evaluation_report.json"
     report_data = {
         "overall": {
             "total_audio_duration_s": total_audio_duration,
@@ -181,9 +181,27 @@ def main():
         "details": results
     }
     
-    with open(report_path, "w", encoding="utf-8") as f:
+    with open(report_json_path, "w", encoding="utf-8") as f:
         json.dump(report_data, f, ensure_ascii=False, indent=2)
-    print(f"\nEvaluation report saved to {report_path}")
+    print(f"\nEvaluation report JSON saved to {report_json_path}")
+    
+    # Save report Markdown
+    report_md_path = Path(__file__).parent / "evaluation_report.md"
+    with open(report_md_path, "w", encoding="utf-8") as f:
+        f.write("# Japanese ASR Evaluation Report\n\n")
+        f.write(f"**Timestamp:** {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+        f.write("## Overall Metrics\n")
+        f.write(f"- **Total Audio Duration:** {total_audio_duration:.2f}s\n")
+        f.write(f"- **Total Processing Time:** {total_processing_time:.2f}s\n")
+        f.write(f"- **Average RTF:** {overall_rtf:.2f}\n\n")
+        
+        f.write("## Detailed Results\n")
+        f.write("| Filename | Duration | Latency | RTF | Error Rate (CER/WER) |\n")
+        f.write("|----------|----------|---------|-----|----------------------|\n")
+        for row in table_rows:
+            f.write(f"| {row[0]} | {row[1]} | {row[2]} | {row[3]} | {row[4]} |\n")
+        
+    print(f"Evaluation report Markdown saved to {report_md_path}")
 
 if __name__ == "__main__":
     main()

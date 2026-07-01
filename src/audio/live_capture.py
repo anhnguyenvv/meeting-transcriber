@@ -120,6 +120,24 @@ class LiveCapture:
         self._mic_native_rate = 16000
         self._lb_native_rate = 16000
 
+        # Initialize Silero VAD model lazily or fall back to RMS
+        try:
+            import torch
+            # Set number of threads to 1 for lightweight CPU inference
+            torch.set_num_threads(1)
+            self._vad_model, utils = torch.hub.load(
+                repo_or_dir='snakers4/silero-vad',
+                model='silero_vad',
+                force_reload=False,
+                trust_repo=True
+            )
+            self._get_speech_timestamps = utils[0]
+            logger.info("Silero VAD model loaded successfully.")
+        except Exception as e:
+            logger.warning("Failed to load Silero VAD, falling back to RMS. Error: %s", e)
+            self._vad_model = None
+            self._get_speech_timestamps = None
+
     # ── Public API ────────────────────────────────────────────────────────────
 
     @property
@@ -358,9 +376,27 @@ class LiveCapture:
         # Normalize — prevent clipping, apply soft gain
         chunk_data = self._normalize(mixed)
 
-        # Check silence
-        rms = np.sqrt(np.mean(chunk_data ** 2))
-        is_silent = rms < self.silence_threshold
+        # Check silence using Silero VAD with RMS fallback
+        is_silent = True
+        if self._vad_model is not None and self._get_speech_timestamps is not None:
+            try:
+                import torch
+                # Convert numpy float32 chunk to torch tensor
+                tensor = torch.from_numpy(chunk_data)
+                speech_timestamps = self._get_speech_timestamps(
+                    tensor,
+                    self._vad_model,
+                    sampling_rate=self.sample_rate,
+                    return_seconds=True
+                )
+                is_silent = len(speech_timestamps) == 0
+            except Exception as e:
+                logger.warning("Silero VAD inference failed, falling back to RMS. Error: %s", e)
+                rms = np.sqrt(np.mean(chunk_data ** 2))
+                is_silent = rms < self.silence_threshold
+        else:
+            rms = np.sqrt(np.mean(chunk_data ** 2))
+            is_silent = rms < self.silence_threshold
 
         offset = self._total_samples_delivered / self.sample_rate
         self._total_samples_delivered += self._step_samples

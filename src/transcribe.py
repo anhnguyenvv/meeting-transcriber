@@ -19,20 +19,20 @@ from typing import Callable, List, Optional
 import numpy as np
 import soundfile as sf
 
-from src.config import WHISPER_MODEL, MULTILINGUAL_CHUNK_S, SAMPLE_RATE
+from src.config import WHISPER_MODEL, JAPANESE_ASR_MODEL, MULTILINGUAL_CHUNK_S, SAMPLE_RATE
 
 logger = logging.getLogger(__name__)
 
 SUPPORTED_LANGS = {"en", "vi", "ja"}
 
-# Lazy-loaded model (loaded once, reused)
-_model = None
+# Lazy-loaded models (loaded once, reused)
+_models = {}
 
 
-def _get_model():
-    global _model
-    if _model is None:
-        logger.info("Loading Whisper model '%s' …", WHISPER_MODEL)
+def _get_model(lang: Optional[str] = None):
+    model_name = JAPANESE_ASR_MODEL if lang == "ja" else WHISPER_MODEL
+    if model_name not in _models:
+        logger.info("Loading Whisper model '%s' …", model_name)
         try:
             import torch
             from faster_whisper import WhisperModel
@@ -41,10 +41,10 @@ def _get_model():
             # int8_float16 on CUDA, int8 on CPU (good for Apple Silicon too)
             compute_type = "int8_float16" if device == "cuda" else "int8"
             logger.info("Using device=%s, compute_type=%s", device, compute_type)
-            _model = WhisperModel(WHISPER_MODEL, device=device, compute_type=compute_type)
+            _models[model_name] = WhisperModel(model_name, device=device, compute_type=compute_type)
         except Exception as e:
             raise RuntimeError(f"Failed to load Whisper model: {e}") from e
-    return _model
+    return _models[model_name]
 
 
 # ── Data class ────────────────────────────────────────────────────────────────
@@ -173,7 +173,7 @@ def run_multilingual(
     if not audio_path.exists():
         raise FileNotFoundError(audio_path)
 
-    model = _get_model()
+    default_model = _get_model() # Load default model for language detection
 
     if progress_cb:
         progress_cb("🎙️ Đang nhận dạng đa ngôn ngữ (per-chunk) …")
@@ -207,7 +207,7 @@ def run_multilingual(
         chunk_offset = start_sample / sr  # seconds offset from file start
 
         # Detect language for this chunk
-        lang, prob = _detect_language(model, chunk_audio)
+        lang, prob = _detect_language(default_model, chunk_audio)
         if progress_cb:
             progress_cb(
                 f"🌐 Chunk {i+1}/{len(chunks)}: ngôn ngữ={lang} (p={prob:.2f})"
@@ -215,14 +215,12 @@ def run_multilingual(
         logger.info("Chunk %d/%d: lang=%s (prob=%.2f), offset=%.1fs",
                      i + 1, len(chunks), lang, prob, chunk_offset)
 
-        # Write chunk to temp file for transcription
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-            tmp_path = f.name
-            sf.write(tmp_path, chunk_audio, sr)
+        # Use specific model based on detected language
+        model = _get_model(lang)
 
         try:
             segments_iter, _ = model.transcribe(
-                tmp_path,
+                chunk_audio,
                 language=lang,       # force detected language
                 task="transcribe",
                 vad_filter=True,
@@ -240,8 +238,8 @@ def run_multilingual(
                         language=lang,
                     )
                 )
-        finally:
-            Path(tmp_path).unlink(missing_ok=True)
+        except Exception as e:
+            logger.error("Error transcribing chunk %d: %s", i + 1, e)
 
     # Sort by start time (should be ordered, but ensure)
     all_segments.sort(key=lambda s: s.start)

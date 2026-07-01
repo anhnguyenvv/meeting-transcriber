@@ -29,6 +29,7 @@ OUTPUTS_DIR.mkdir(exist_ok=True)
 
 # ── Whisper ───────────────────────────────────────────────────────────────────
 WHISPER_MODEL: str = os.getenv("WHISPER_MODEL", "small")
+JAPANESE_ASR_MODEL: str = os.getenv("JAPANESE_ASR_MODEL", "kotoba-tech/kotoba-whisper-v2.0-faster")
 # Supported language codes for faster-whisper auto-detect output
 SUPPORTED_LANGS: set[str] = {"ja", "en", "vi"}
 SAMPLE_RATE: int = 16_000  # Hz — required by Whisper
