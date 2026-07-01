@@ -40,6 +40,14 @@ Dự án kết hợp sức mạnh của các mô hình AI tiên tiến:
 > 💡 Dùng `WHISPER_MODEL=medium` trong `.env` để tăng tốc ~2× (hy sinh chút độ chính xác).
 
 ---
+## 🏗️ Kiến trúc hệ thống & Tài liệu kỹ thuật
+
+Để xem thông tin chi tiết về kiến trúc hệ thống, luồng dữ liệu, các quyết định công nghệ và cách xử lý các thách thức kỹ thuật (như Smart Ducking, đồng bộ thời gian), vui lòng tham khảo tài liệu chi tiết:
+
+👉 **[Tài liệu Kiến trúc hệ thống (Tiếng Anh)](docs/architecture.md)**
+
+---
+
 
 ## ⚡ Cài đặt nhanh
 
