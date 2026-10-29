@@ -135,6 +135,17 @@ mixNode.connect(processor);
 
 On the backend, FastAPI endpoints (`/api/live/chunk`) receive the binary data, decode it directly into NumPy float32 arrays, and stream them into the `LiveTranscriber` pipeline.
 
+The browser live UI exposes three capture modes:
+
+- **Microphone** — captures only the local microphone.
+- **System / Tab** — captures audio shared from a browser tab or system output.
+- **Both** — captures both sources and mixes them before transcription.
+
+For microphone capture, the UI also exposes browser-level echo cancellation, noise
+suppression, and automatic gain control. These constraints are applied by
+`getUserMedia`; they complement, but do not replace, the existing server-side
+VAD and transcription processing.
+
 
 ---
 
@@ -166,4 +177,3 @@ The **Gradio UI** displays this data in the **"📊 Thống kê & Giám sát"** 
 - KPI metrics (total meetings, total transcribed time, average RTF).
 - A latency breakdown table comparing the time cost of each pipeline component.
 - Meeting language distribution statistics.
-

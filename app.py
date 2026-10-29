@@ -949,8 +949,9 @@ Chọn **mic** (giọng bạn) và/hoặc **loopback** (âm thanh hệ thống t
 ### 🌐 Live từ Trình duyệt (Không cần VB-CABLE)
 
 Ghi âm và bóc băng trực tiếp thông qua micro và âm thanh của trình duyệt mà không cần cài đặt bất kỳ phần mềm loopback nào!
-- **Để bóc băng cuộc họp online (Google Meet, Zoom web...):** Chọn nguồn **Cả hai (Mic + Loa)** hoặc **Chỉ Loa (Hệ thống)**. Khi trình duyệt hiện hộp thoại chia sẻ màn hình, hãy chọn tab/màn hình cuộc họp và tích chọn **"Chia sẻ âm thanh hệ thống/tab"** (Share tab audio).
-- **Để bóc băng phòng họp trực tiếp:** Chọn nguồn **Chỉ Microphone**.
+- **Microphone:** phù hợp họp trực tiếp, chỉ thu giọng nói từ micro.
+- **System / Tab:** phù hợp Google Meet, Zoom web hoặc video; khi được hỏi, hãy bật **"Chia sẻ âm thanh"**.
+- **Cả hai:** thu đồng thời micro và âm thanh tab/hệ thống, phù hợp họp trực tuyến.
 """
             )
 
@@ -963,26 +964,36 @@ Ghi âm và bóc băng trực tiếp thông qua micro và âm thanh của trình
             window.browserAudioStreams = [];
             window.browserAudioOffset = 0;
 
-            async function startBrowserAudioCapture(title, lang) {
+            async function startBrowserAudioCapture(title, lang, echoCancellation, noiseSuppression, autoGainControl) {
                 if (window.browserAudioActive) return;
                 
                 try {
                     // Lọc nguồn âm thanh từ radio buttons của Gradio
-                    const sourceChoice = document.querySelector("#browser_audio_source input:checked")?.value || "🔊 Cả hai (Mic + Loa)";
+                    const sourceChoice = document.querySelector("#browser_audio_source input:checked")?.value || "🎙️ Cả hai";
                     console.log("Selected source:", sourceChoice);
                     
                     let micStream = null;
                     let systemStream = null;
                     
-                    if (sourceChoice.includes("Mic") || sourceChoice.includes("Cả hai")) {
-                        micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                    if (sourceChoice.includes("Microphone") || sourceChoice.includes("Cả hai")) {
+                        micStream = await navigator.mediaDevices.getUserMedia({
+                            audio: {
+                                echoCancellation: Boolean(echoCancellation),
+                                noiseSuppression: Boolean(noiseSuppression),
+                                autoGainControl: Boolean(autoGainControl)
+                            }
+                        });
                     }
                     
-                    if (sourceChoice.includes("Loa") || sourceChoice.includes("Cả hai")) {
+                    if (sourceChoice.includes("System / Tab") || sourceChoice.includes("Cả hai")) {
                         systemStream = await navigator.mediaDevices.getDisplayMedia({
                             video: { width: 1, height: 1 },
                             audio: true
                         });
+                        if (!systemStream.getAudioTracks().length) {
+                            systemStream.getTracks().forEach(track => track.stop());
+                            throw new Error("Không nhận được audio từ tab/hệ thống. Hãy bật 'Chia sẻ âm thanh'.");
+                        }
                     }
                     
                     const AudioContextClass = window.AudioContext || window.webkitAudioContext;
@@ -1018,7 +1029,11 @@ Ghi âm và bóc băng trực tiếp thông qua micro và âm thanh của trình
                         return;
                     }
                     
-                    processor.connect(audioCtx.destination);
+                    // Keep ScriptProcessor alive without playing the captured meeting back.
+                    const silentSink = audioCtx.createGain();
+                    silentSink.gain.value = 0;
+                    processor.connect(silentSink);
+                    silentSink.connect(audioCtx.destination);
                     
                     window.browserAudioStreams = [micStream, systemStream].filter(s => s !== null);
                     window.browserAudioActive = true;
@@ -1105,11 +1120,54 @@ Ghi âm và bóc băng trực tiếp thông qua micro và âm thanh của trình
 
             with gr.Row():
                 browser_audio_src = gr.Radio(
-                    choices=["🎤 Chỉ Microphone", "🔊 Chỉ Loa (Hệ thống)", "🔊 Cả hai (Mic + Loa)"],
-                    value="🔊 Cả hai (Mic + Loa)",
-                    label="🎙️ Chọn nguồn âm thanh thu từ trình duyệt",
+                    choices=[
+                        "🎙️ Microphone",
+                        "🖥️ System / Tab",
+                        "🎙️ Cả hai",
+                    ],
+                    value="🎙️ Cả hai",
+                    label="Nguồn âm thanh",
                     elem_id="browser_audio_source"
                 )
+
+            browser_source_hint = gr.Markdown(
+                "**Cả hai:** thu micro và âm thanh tab/hệ thống cho các cuộc họp trực tuyến.",
+                elem_id="browser_source_hint",
+            )
+
+            def _browser_source_hint(source: str) -> str:
+                if source == "🎙️ Microphone":
+                    return "**Microphone:** phù hợp họp trực tiếp; chỉ thu âm thanh từ micro."
+                if source == "🖥️ System / Tab":
+                    return "**System / Tab:** chọn tab hoặc màn hình và bật **Chia sẻ âm thanh**."
+                return "**Cả hai:** thu micro và âm thanh tab/hệ thống cho các cuộc họp trực tuyến."
+
+            browser_audio_src.change(
+                fn=_browser_source_hint,
+                inputs=[browser_audio_src],
+                outputs=[browser_source_hint],
+            )
+
+            with gr.Accordion("⚙️ Cài đặt microphone", open=False):
+                gr.Markdown(
+                    "Các tuỳ chọn này áp dụng cho nguồn **Microphone** và **Cả hai**."
+                )
+                with gr.Row():
+                    browser_echo_chk = gr.Checkbox(
+                        label="Echo cancellation",
+                        info="Giảm tiếng loa lọt vào micro",
+                        value=True,
+                    )
+                    browser_noise_chk = gr.Checkbox(
+                        label="Noise suppression",
+                        info="Lọc nhiễu nền",
+                        value=True,
+                    )
+                    browser_agc_chk = gr.Checkbox(
+                        label="Auto gain control",
+                        info="Tự cân bằng âm lượng micro",
+                        value=False,
+                    )
 
             with gr.Row():
                 browser_title = gr.Textbox(
@@ -1168,7 +1226,13 @@ Ghi âm và bóc băng trực tiếp thông qua micro và âm thanh của trình
                     browser_post_sum = gr.Markdown("*(Đang tóm tắt...)*")
 
             # ── Browser live button wiring ────────────────────────────────────
-            def _start_browser_live_wrapper(title, lang_choice):
+            def _start_browser_live_wrapper(
+                title,
+                lang_choice,
+                echo_cancellation,
+                noise_suppression,
+                auto_gain_control,
+            ):
                 lang = _resolve_lang(lang_choice)
                 global _browser_live_transcriber, _browser_audio_chunks, _browser_live_title
                 with _browser_live_lock:
@@ -1195,9 +1259,15 @@ Ghi âm và bóc băng trực tiếp thông qua micro và âm thanh của trình
             # Trigger JS start capturing on browser
             btn_browser_start.click(
                 fn=_start_browser_live_wrapper,
-                inputs=[browser_title, browser_language],
+                inputs=[
+                    browser_title,
+                    browser_language,
+                    browser_echo_chk,
+                    browser_noise_chk,
+                    browser_agc_chk,
+                ],
                 outputs=[browser_status, browser_transcript],
-                js="async (title, lang) => { await startBrowserAudioCapture(title, lang); }"
+                js="async (title, lang, echo, noise, agc) => { await startBrowserAudioCapture(title, lang, echo, noise, agc); }"
             )
 
             # Auto-refresh live transcript with Timer
